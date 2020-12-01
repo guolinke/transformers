@@ -25,6 +25,7 @@ if is_torch_available():
         BertModel,
         BertPreTrainedModel,
         load_tf_weights_in_bert,
+        convert_tupe_checkpoint_to_pytorch,
     )
 
 if is_tf_available():

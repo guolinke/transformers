@@ -22,7 +22,9 @@ import warnings
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import pathlib
 import torch
+import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss, MSELoss
@@ -162,23 +164,157 @@ def load_tf_weights_in_bert(model, config, tf_checkpoint_path):
     return model
 
 
+def convert_tupe_checkpoint_to_pytorch(
+    checkpoint_path: str, pytorch_dump_folder_path: str
+):
+    """
+    Copy/paste/tweak roberta's weights to our BERT structure.
+    """
+    from torch.serialization import default_restore_location
+    with open(checkpoint_path, "rb") as f:
+        state = torch.load(f, map_location=lambda s, l: default_restore_location(s, "cpu"))
+    model_state = state['model']
+    key_prefix = "encoder.sentence_encoder."
+    config = BertConfig()
+    model = BertForMaskedLM(config)
+    # use CPU to load
+    model.to(torch.device("cpu"))
+    model.eval()
+
+    # Now let's copy all the weights.
+    # Embeddings
+    assert model.bert.embeddings.word_embeddings.weight.data.shape == model_state[key_prefix + 'embed_tokens.weight'].shape
+    model.bert.embeddings.word_embeddings.weight.data = model_state[key_prefix + 'embed_tokens.weight']
+
+    assert model.bert.embeddings.position_embeddings.weight.data.shape == model_state[key_prefix + 'pos.weight'].shape
+    model.bert.embeddings.position_embeddings.weight.data = model_state[key_prefix + 'pos.weight']
+    model.bert.embeddings.pos_k_linear.weight.data = model_state[key_prefix + 'pos_k_linear.weight']
+    model.bert.embeddings.pos_q_linear.weight.data = model_state[key_prefix + 'pos_q_linear.weight']
+    model.bert.embeddings.pos_k_linear.bias.data = model_state[key_prefix + 'pos_k_linear.bias']
+    model.bert.embeddings.pos_q_linear.bias.data = model_state[key_prefix + 'pos_q_linear.bias']
+    model.bert.embeddings.pos_ln.weight.data = model_state[key_prefix + 'pos_ln.weight']
+    model.bert.embeddings.pos_ln.bias.data = model_state[key_prefix + 'pos_ln.bias']
+
+    assert model.bert.embeddings.relative_attention_bias.weight.data.shape == model_state[key_prefix + 'relative_attention_bias.weight'].shape
+    model.bert.embeddings.relative_attention_bias.weight.data = model_state[key_prefix + 'relative_attention_bias.weight']
+    model.bert.embeddings.LayerNorm.weight.data = model_state[key_prefix + 'emb_layer_norm.weight']
+    model.bert.embeddings.LayerNorm.bias.data = model_state[key_prefix + 'emb_layer_norm.bias']
+
+    for i in range(config.num_hidden_layers):
+        # Encoder: start of layer
+        layer: BertLayer = model.bert.encoder.layer[i]
+        layer_prefix = 'encoder.sentence_encoder.layers.' + str(i) + '.'
+
+        # self attention
+        self_attn: BertSelfAttention = layer.attention.self
+
+        self_attn.in_proj.weight.data = model_state[layer_prefix + 'self_attn.in_proj.weight']
+        self_attn.in_proj.bias.data = model_state[layer_prefix + 'self_attn.in_proj.bias']
+
+        self_output: BertSelfOutput = layer.attention.output
+
+        self_output.dense.weight.data = model_state[layer_prefix + 'self_attn.out_proj.weight']
+        self_output.dense.bias.data = model_state[layer_prefix + 'self_attn.out_proj.bias']
+        self_output.LayerNorm.weight.data = model_state[layer_prefix + 'self_attn_layer_norm.weight']
+        self_output.LayerNorm.bias.data = model_state[layer_prefix + 'self_attn_layer_norm.bias']
+
+        intermediate: BertIntermediate = layer.intermediate
+        intermediate.dense.weight.data = model_state[layer_prefix + 'fc1.weight']
+        intermediate.dense.bias.data = model_state[layer_prefix + 'fc1.bias']
+
+        bert_output: BertOutput = layer.output
+        bert_output.dense.weight.data = model_state[layer_prefix + 'fc2.weight']
+        bert_output.dense.bias.data = model_state[layer_prefix + 'fc2.bias']
+        bert_output.LayerNorm.weight.data = model_state[layer_prefix + 'final_layer_norm.weight']
+        bert_output.LayerNorm.bias.data = model_state[layer_prefix + 'final_layer_norm.bias']
+        # end of layer
+
+    pathlib.Path(pytorch_dump_folder_path).mkdir(parents=True, exist_ok=True)
+    print(f"Saving model to {pytorch_dump_folder_path}")
+    # save GPU model
+    model.to(torch.device("cuda"))
+    model.save_pretrained(pytorch_dump_folder_path)
+
+
+def relative_position_bucket(relative_position, bidirectional=True, num_buckets=32, max_distance=128):
+    ret = 0
+    n = -relative_position
+    if bidirectional:
+        num_buckets //= 2
+        ret += (n < 0).to(torch.long) * num_buckets  # mtf.to_int32(mtf.less(n, 0)) * num_buckets
+        n = torch.abs(n)
+    else:
+        n = torch.max(n, torch.zeros_like(n))
+    # now n is in the range [0, inf)
+
+    # half of the buckets are for exact increments in positions
+    max_exact = num_buckets // 2
+    is_small = n < max_exact
+    # The other half of the buckets are for logarithmically bigger bins in positions up to max_distance
+    val_if_large = max_exact + (
+        torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)
+    ).to(torch.long)
+    val_if_large = torch.min(val_if_large, torch.full_like(val_if_large, num_buckets - 1))
+
+    ret += torch.where(is_small, n, val_if_large)
+    return ret
+
 class BertEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings."""
 
     def __init__(self, config):
         super().__init__()
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
-
+        self.position_embeddings = nn.Embedding(config.max_position_embeddings + 1, config.hidden_size)
+        self.pos_q_linear = nn.Linear(config.hidden_size, config.hidden_size)
+        self.pos_k_linear = nn.Linear(config.hidden_size, config.hidden_size)
+        self.pos_ln = nn.LayerNorm(config.hidden_size, eps=1e-5)
+        self.num_attention_heads = config.num_attention_heads
+        self.pos_scaling = float(config.hidden_size / self.num_attention_heads * 2) ** -0.5
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=1e-5)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        # relative positions
+        self.rel_pos_bins = 32
+        self.max_rel_pos = 128
+        self.relative_attention_bias = nn.Embedding(self.rel_pos_bins + 1, self.num_attention_heads)
+        seq_len = config.max_position_embeddings
+        context_position = torch.arange(seq_len, dtype=torch.long)[:, None]
+        memory_position = torch.arange(seq_len, dtype=torch.long)[None, :]
+        relative_position = memory_position - context_position
+        self.rp_bucket = relative_position_bucket(
+            relative_position,
+            num_buckets=self.rel_pos_bins,
+            max_distance=self.max_rel_pos
+        )
+        self.rp_bucket[:, 0] = self.rel_pos_bins
+        self.rp_bucket[0, :] = self.rel_pos_bins // 2
 
-        # position_ids (1, len position emb) is contiguous in memory and exported when serialized
-        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)))
-        self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
+    def get_rel_pos_bias(self, x):
+        if self.rp_bucket.device != x.device:
+            self.rp_bucket = self.rp_bucket.to(x.device)
+        seq_len = x.size(1)
+        rp_bucket = self.rp_bucket[:seq_len, :seq_len]
+        values = F.embedding(rp_bucket, self.relative_attention_bias.weight)
+        values = values.permute([2, 0, 1])
+        return values.contiguous()
+    
+    def get_tupe_bias(self, x):
+        seq_len = x.size(1)
+        weight = self.pos_ln(self.position_embeddings.weight[:seq_len + 1, :])
+        pos_q =  self.pos_q_linear(weight).view(seq_len + 1, self.num_attention_heads, -1).transpose(0, 1) * (self.pos_scaling)
+        pos_k =  self.pos_k_linear(weight).view(seq_len + 1, self.num_attention_heads, -1).transpose(0, 1)
+        abs_pos_bias = torch.bmm(pos_q, pos_k.transpose(1, 2))
+        # p_0 \dot p_0 is cls to others
+        cls_2_other = abs_pos_bias[:, 0, 0]
+        # p_1 \dot p_1 is others to cls
+        other_2_cls = abs_pos_bias[:, 1, 1]
+        # offset 
+        abs_pos_bias = abs_pos_bias[:, 1:, 1:]
+        abs_pos_bias[:, :, 0] = other_2_cls.view(-1, 1)
+        abs_pos_bias[:, 0, :] = cls_2_other.view(-1, 1)
+        return abs_pos_bias
 
     def forward(self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None):
         if input_ids is not None:
@@ -188,23 +324,15 @@ class BertEmbeddings(nn.Module):
 
         seq_length = input_shape[1]
 
-        if position_ids is None:
-            position_ids = self.position_ids[:, :seq_length]
-
-        if token_type_ids is None:
-            token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
-
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
-        token_type_embeddings = self.token_type_embeddings(token_type_ids)
+        
+        rel_pos_bias = self.get_rel_pos_bias(inputs_embeds)
+        tupe_bias = self.get_tupe_bias(inputs_embeds)
 
-        embeddings = inputs_embeds + token_type_embeddings
-        if self.position_embedding_type == "absolute":
-            position_embeddings = self.position_embeddings(position_ids)
-            embeddings += position_embeddings
-        embeddings = self.LayerNorm(embeddings)
+        embeddings = self.LayerNorm(inputs_embeds)
         embeddings = self.dropout(embeddings)
-        return embeddings
+        return embeddings, tupe_bias + rel_pos_bias
 
 
 class BertSelfAttention(nn.Module):
@@ -220,15 +348,9 @@ class BertSelfAttention(nn.Module):
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-        self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        self.in_proj = nn.Linear(config.hidden_size, self.all_head_size * 3)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
-        self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
-        if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
-            self.max_position_embeddings = config.max_position_embeddings
-            self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
@@ -239,24 +361,16 @@ class BertSelfAttention(nn.Module):
         self,
         hidden_states,
         attention_mask=None,
+        attention_bias=None,
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
         output_attentions=False,
     ):
-        mixed_query_layer = self.query(hidden_states)
+        assert encoder_hidden_states is None
+        assert head_mask is None
 
-        # If this is instantiated as a cross-attention module, the keys
-        # and values come from an encoder; the attention mask needs to be
-        # such that the encoder's padding tokens are not attended to.
-        if encoder_hidden_states is not None:
-            mixed_key_layer = self.key(encoder_hidden_states)
-            mixed_value_layer = self.value(encoder_hidden_states)
-            attention_mask = encoder_attention_mask
-        else:
-            mixed_key_layer = self.key(hidden_states)
-            mixed_value_layer = self.value(hidden_states)
-
+        mixed_query_layer, mixed_key_layer, mixed_value_layer = self.in_proj(hidden_states).chunk(3, dim=-1)
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
         value_layer = self.transpose_for_scores(mixed_value_layer)
@@ -264,26 +378,15 @@ class BertSelfAttention(nn.Module):
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
 
-        if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
-            seq_length = hidden_states.size()[1]
-            position_ids_l = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(-1, 1)
-            position_ids_r = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(1, -1)
-            distance = position_ids_l - position_ids_r
-            positional_embedding = self.distance_embedding(distance + self.max_position_embeddings - 1)
-            positional_embedding = positional_embedding.to(dtype=query_layer.dtype)  # fp16 compatibility
-
-            if self.position_embedding_type == "relative_key":
-                relative_position_scores = torch.einsum("bhld,lrd->bhlr", query_layer, positional_embedding)
-                attention_scores = attention_scores + relative_position_scores
-            elif self.position_embedding_type == "relative_key_query":
-                relative_position_scores_query = torch.einsum("bhld,lrd->bhlr", query_layer, positional_embedding)
-                relative_position_scores_key = torch.einsum("bhrd,lrd->bhlr", key_layer, positional_embedding)
-                attention_scores = attention_scores + relative_position_scores_query + relative_position_scores_key
-
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        # tupe, *2 for scaling
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size * 2)
         if attention_mask is not None:
             # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
             attention_scores = attention_scores + attention_mask
+        
+        assert attention_bias is not None
+        if attention_bias is not None:
+            attention_scores += attention_bias
 
         # Normalize the attention scores to probabilities.
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
@@ -291,10 +394,6 @@ class BertSelfAttention(nn.Module):
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
         attention_probs = self.dropout(attention_probs)
-
-        # Mask heads if we want to
-        if head_mask is not None:
-            attention_probs = attention_probs * head_mask
 
         context_layer = torch.matmul(attention_probs, value_layer)
 
@@ -310,7 +409,7 @@ class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=1e-5)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
@@ -327,28 +426,11 @@ class BertAttention(nn.Module):
         self.output = BertSelfOutput(config)
         self.pruned_heads = set()
 
-    def prune_heads(self, heads):
-        if len(heads) == 0:
-            return
-        heads, index = find_pruneable_heads_and_indices(
-            heads, self.self.num_attention_heads, self.self.attention_head_size, self.pruned_heads
-        )
-
-        # Prune linear layers
-        self.self.query = prune_linear_layer(self.self.query, index)
-        self.self.key = prune_linear_layer(self.self.key, index)
-        self.self.value = prune_linear_layer(self.self.value, index)
-        self.output.dense = prune_linear_layer(self.output.dense, index, dim=1)
-
-        # Update hyper params and store pruned heads
-        self.self.num_attention_heads = self.self.num_attention_heads - len(heads)
-        self.self.all_head_size = self.self.attention_head_size * self.self.num_attention_heads
-        self.pruned_heads = self.pruned_heads.union(heads)
-
     def forward(
         self,
         hidden_states,
         attention_mask=None,
+        attention_bias=None,
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
@@ -357,6 +439,7 @@ class BertAttention(nn.Module):
         self_outputs = self.self(
             hidden_states,
             attention_mask,
+            attention_bias,
             head_mask,
             encoder_hidden_states,
             encoder_attention_mask,
@@ -386,7 +469,7 @@ class BertOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=1e-5)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
@@ -414,6 +497,7 @@ class BertLayer(nn.Module):
         self,
         hidden_states,
         attention_mask=None,
+        attention_bias=None,
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
@@ -422,12 +506,14 @@ class BertLayer(nn.Module):
         self_attention_outputs = self.attention(
             hidden_states,
             attention_mask,
+            attention_bias,
             head_mask,
             output_attentions=output_attentions,
         )
         attention_output = self_attention_outputs[0]
         outputs = self_attention_outputs[1:]  # add self attentions if we output attention weights
 
+        assert encoder_hidden_states is None
         if self.is_decoder and encoder_hidden_states is not None:
             assert hasattr(
                 self, "crossattention"
@@ -435,6 +521,7 @@ class BertLayer(nn.Module):
             cross_attention_outputs = self.crossattention(
                 attention_output,
                 attention_mask,
+                attention_bias,
                 head_mask,
                 encoder_hidden_states,
                 encoder_attention_mask,
@@ -465,6 +552,7 @@ class BertEncoder(nn.Module):
         self,
         hidden_states,
         attention_mask=None,
+        attention_bias=None,
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
@@ -493,6 +581,7 @@ class BertEncoder(nn.Module):
                     create_custom_forward(layer_module),
                     hidden_states,
                     attention_mask,
+                    attention_bias,
                     layer_head_mask,
                     encoder_hidden_states,
                     encoder_attention_mask,
@@ -501,6 +590,7 @@ class BertEncoder(nn.Module):
                 layer_outputs = layer_module(
                     hidden_states,
                     attention_mask,
+                    attention_bias,
                     layer_head_mask,
                     encoder_hidden_states,
                     encoder_attention_mask,
@@ -552,7 +642,7 @@ class BertPredictionHeadTransform(nn.Module):
             self.transform_act_fn = ACT2FN[config.hidden_act]
         else:
             self.transform_act_fn = config.hidden_act
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=1e-5)
 
     def forward(self, hidden_states):
         hidden_states = self.dense(hidden_states)
@@ -858,12 +948,13 @@ class BertModel(BertPreTrainedModel):
         # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
-        embedding_output = self.embeddings(
+        embedding_output, attention_bias = self.embeddings(
             input_ids=input_ids, position_ids=position_ids, token_type_ids=token_type_ids, inputs_embeds=inputs_embeds
         )
         encoder_outputs = self.encoder(
             embedding_output,
             attention_mask=extended_attention_mask,
+            attention_bias=attention_bias,
             head_mask=head_mask,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_extended_attention_mask,
