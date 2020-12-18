@@ -175,7 +175,19 @@ def convert_tupe_checkpoint_to_pytorch(
         state = torch.load(f, map_location=lambda s, l: default_restore_location(s, "cpu"))
     model_state = state['model']
     key_prefix = "encoder.sentence_encoder."
-    config = BertConfig()
+    config = BertConfig(vocab_size=32768, 
+        hidden_size=768,
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        intermediate_size=3072,
+        hidden_act="gelu",
+        hidden_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.1,
+        max_position_embeddings=512,
+        type_vocab_size=2,
+        initializer_range=0.02,
+        layer_norm_eps=1e-5,
+        pad_token_id=1,)
     model = BertForMaskedLM(config)
     # use CPU to load
     model.to(torch.device("cpu"))
@@ -235,6 +247,88 @@ def convert_tupe_checkpoint_to_pytorch(
     model.to(torch.device("cuda"))
     model.save_pretrained(pytorch_dump_folder_path)
 
+def convert_large_tupe_checkpoint_to_pytorch(
+    checkpoint_path: str, pytorch_dump_folder_path: str
+):
+    """
+    Copy/paste/tweak roberta's weights to our BERT structure.
+    """
+    from torch.serialization import default_restore_location
+    with open(checkpoint_path, "rb") as f:
+        state = torch.load(f, map_location=lambda s, l: default_restore_location(s, "cpu"))
+    model_state = state['model']
+    key_prefix = "encoder.sentence_encoder."
+    config = BertConfig(vocab_size=36864, 
+        hidden_size=1024,
+        num_hidden_layers=24,
+        num_attention_heads=16,
+        intermediate_size=4096,
+        hidden_act="gelu",
+        hidden_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.1,
+        max_position_embeddings=512,
+        type_vocab_size=2,
+        initializer_range=0.02,
+        layer_norm_eps=1e-5,
+        pad_token_id=1,)
+    model = BertForMaskedLM(config)
+    # use CPU to load
+    model.to(torch.device("cpu"))
+    model.eval()
+
+    # Now let's copy all the weights.
+    # Embeddings
+    assert model.bert.embeddings.word_embeddings.weight.data.shape == model_state[key_prefix + 'embed_tokens.weight'].shape
+    model.bert.embeddings.word_embeddings.weight.data = model_state[key_prefix + 'embed_tokens.weight']
+
+    assert model.bert.embeddings.position_embeddings.weight.data.shape == model_state[key_prefix + 'pos.weight'].shape
+    model.bert.embeddings.position_embeddings.weight.data = model_state[key_prefix + 'pos.weight']
+    model.bert.embeddings.pos_k_linear.weight.data = model_state[key_prefix + 'pos_k_linear.weight']
+    model.bert.embeddings.pos_q_linear.weight.data = model_state[key_prefix + 'pos_q_linear.weight']
+    model.bert.embeddings.pos_k_linear.bias.data = model_state[key_prefix + 'pos_k_linear.bias']
+    model.bert.embeddings.pos_q_linear.bias.data = model_state[key_prefix + 'pos_q_linear.bias']
+    model.bert.embeddings.pos_ln.weight.data = model_state[key_prefix + 'pos_ln.weight']
+    model.bert.embeddings.pos_ln.bias.data = model_state[key_prefix + 'pos_ln.bias']
+
+    assert model.bert.embeddings.relative_attention_bias.weight.data.shape == model_state[key_prefix + 'relative_attention_bias.weight'].shape
+    model.bert.embeddings.relative_attention_bias.weight.data = model_state[key_prefix + 'relative_attention_bias.weight']
+    model.bert.embeddings.LayerNorm.weight.data = model_state[key_prefix + 'emb_layer_norm.weight']
+    model.bert.embeddings.LayerNorm.bias.data = model_state[key_prefix + 'emb_layer_norm.bias']
+
+    for i in range(config.num_hidden_layers):
+        # Encoder: start of layer
+        layer: BertLayer = model.bert.encoder.layer[i]
+        layer_prefix = 'encoder.sentence_encoder.layers.' + str(i) + '.'
+
+        # self attention
+        self_attn: BertSelfAttention = layer.attention.self
+
+        self_attn.in_proj.weight.data = model_state[layer_prefix + 'self_attn.in_proj.weight']
+        self_attn.in_proj.bias.data = model_state[layer_prefix + 'self_attn.in_proj.bias']
+
+        self_output: BertSelfOutput = layer.attention.output
+
+        self_output.dense.weight.data = model_state[layer_prefix + 'self_attn.out_proj.weight']
+        self_output.dense.bias.data = model_state[layer_prefix + 'self_attn.out_proj.bias']
+        self_output.LayerNorm.weight.data = model_state[layer_prefix + 'self_attn_layer_norm.weight']
+        self_output.LayerNorm.bias.data = model_state[layer_prefix + 'self_attn_layer_norm.bias']
+
+        intermediate: BertIntermediate = layer.intermediate
+        intermediate.dense.weight.data = model_state[layer_prefix + 'fc1.weight']
+        intermediate.dense.bias.data = model_state[layer_prefix + 'fc1.bias']
+
+        bert_output: BertOutput = layer.output
+        bert_output.dense.weight.data = model_state[layer_prefix + 'fc2.weight']
+        bert_output.dense.bias.data = model_state[layer_prefix + 'fc2.bias']
+        bert_output.LayerNorm.weight.data = model_state[layer_prefix + 'final_layer_norm.weight']
+        bert_output.LayerNorm.bias.data = model_state[layer_prefix + 'final_layer_norm.bias']
+        # end of layer
+
+    pathlib.Path(pytorch_dump_folder_path).mkdir(parents=True, exist_ok=True)
+    print(f"Saving model to {pytorch_dump_folder_path}")
+    # save GPU model
+    model.to(torch.device("cuda"))
+    model.save_pretrained(pytorch_dump_folder_path)
 
 def relative_position_bucket(relative_position, bidirectional=True, num_buckets=32, max_distance=128):
     ret = 0
