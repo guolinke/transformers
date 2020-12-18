@@ -164,8 +164,8 @@ class BertTokenizer(PreTrainedTokenizer):
     def __init__(
         self,
         vocab_file,
-        do_lower_case=True,
-        do_basic_tokenize=True,
+        do_lower_case=False,
+        do_basic_tokenize=False,
         never_split=None,
         unk_token="[UNK]",
         sep_token="[SEP]",
