@@ -375,6 +375,7 @@ if is_torch_available():
         BertPreTrainedModel,
         load_tf_weights_in_bert,
         convert_tupe_checkpoint_to_pytorch,
+        convert_large_tupe_checkpoint_to_pytorch,
     )
     from .models.bert_generation import (
         BertGenerationDecoder,
