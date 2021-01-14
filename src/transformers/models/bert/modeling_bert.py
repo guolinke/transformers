@@ -207,8 +207,8 @@ def convert_tupe_checkpoint_to_pytorch(
     model.bert.embeddings.pos_ln.weight.data = model_state[key_prefix + 'pos_ln.weight']
     model.bert.embeddings.pos_ln.bias.data = model_state[key_prefix + 'pos_ln.bias']
 
-    assert model.bert.embeddings.relative_attention_bias.weight.data.shape == model_state[key_prefix + 'relative_attention_bias.weight'].shape
-    model.bert.embeddings.relative_attention_bias.weight.data = model_state[key_prefix + 'relative_attention_bias.weight']
+    assert model.bert.embeddings.relative_attention_bias.weight.data.shape == model_state[key_prefix + 'rp.weight'].shape
+    model.bert.embeddings.relative_attention_bias.weight.data = model_state[key_prefix + 'rp.weight']
     model.bert.embeddings.LayerNorm.weight.data = model_state[key_prefix + 'emb_layer_norm.weight']
     model.bert.embeddings.LayerNorm.bias.data = model_state[key_prefix + 'emb_layer_norm.bias']
 
