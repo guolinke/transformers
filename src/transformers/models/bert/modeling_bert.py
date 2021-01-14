@@ -175,7 +175,19 @@ def convert_tupe_checkpoint_to_pytorch(
         state = torch.load(f, map_location=lambda s, l: default_restore_location(s, "cpu"))
     model_state = state['model']
     key_prefix = "encoder.sentence_encoder."
-    config = BertConfig()
+    config = BertConfig(vocab_size=36864, 
+        hidden_size=768,
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        intermediate_size=3072,
+        hidden_act="gelu",
+        hidden_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.1,
+        max_position_embeddings=512,
+        type_vocab_size=0,
+        initializer_range=0.02,
+        layer_norm_eps=1e-5,
+        pad_token_id=1,)
     model = BertForMaskedLM(config)
     # use CPU to load
     model.to(torch.device("cpu"))
@@ -236,7 +248,7 @@ def convert_tupe_checkpoint_to_pytorch(
     model.save_pretrained(pytorch_dump_folder_path)
 
 
-def relative_position_bucket(relative_position, bidirectional=True, num_buckets=32, max_distance=128):
+def relative_position_bucket(relative_position, bidirectional=True, num_buckets=64, max_distance=192):
     ret = 0
     n = -relative_position
     if bidirectional:
@@ -265,7 +277,7 @@ class BertEmbeddings(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings + 1, config.hidden_size)
+        self.position_embeddings = nn.Embedding(config.max_position_embeddings - 1, config.hidden_size)
         self.pos_q_linear = nn.Linear(config.hidden_size, config.hidden_size)
         self.pos_k_linear = nn.Linear(config.hidden_size, config.hidden_size)
         self.pos_ln = nn.LayerNorm(config.hidden_size, eps=1e-5)
@@ -276,8 +288,8 @@ class BertEmbeddings(nn.Module):
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=1e-5)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         # relative positions
-        self.rel_pos_bins = 32
-        self.max_rel_pos = 128
+        self.rel_pos_bins = 64
+        self.max_rel_pos = 192
         self.relative_attention_bias = nn.Embedding(self.rel_pos_bins + 1, self.num_attention_heads)
         seq_len = config.max_position_embeddings
         context_position = torch.arange(seq_len, dtype=torch.long)[:, None]
@@ -302,18 +314,11 @@ class BertEmbeddings(nn.Module):
     
     def get_tupe_bias(self, x):
         seq_len = x.size(1)
-        weight = self.pos_ln(self.position_embeddings.weight[:seq_len + 1, :])
-        pos_q =  self.pos_q_linear(weight).view(seq_len + 1, self.num_attention_heads, -1).transpose(0, 1) * (self.pos_scaling)
-        pos_k =  self.pos_k_linear(weight).view(seq_len + 1, self.num_attention_heads, -1).transpose(0, 1)
+        cls_weight = torch.mean(self.position_embeddings.weight, dim=0).view(1, -1)
+        weight = self.pos_ln(torch.cat([cls_weight, self.position_embeddings.weight[:seq_len - 1, :]], dim=0))
+        pos_q =  self.pos_q_linear(weight).view(seq_len, self.num_attention_heads, -1).transpose(0, 1) * (self.pos_scaling)
+        pos_k =  self.pos_k_linear(weight).view(seq_len, self.num_attention_heads, -1).transpose(0, 1)
         abs_pos_bias = torch.bmm(pos_q, pos_k.transpose(1, 2))
-        # p_0 \dot p_0 is cls to others
-        cls_2_other = abs_pos_bias[:, 0, 0]
-        # p_1 \dot p_1 is others to cls
-        other_2_cls = abs_pos_bias[:, 1, 1]
-        # offset 
-        abs_pos_bias = abs_pos_bias[:, 1:, 1:]
-        abs_pos_bias[:, :, 0] = other_2_cls.view(-1, 1)
-        abs_pos_bias[:, 0, :] = cls_2_other.view(-1, 1)
         return abs_pos_bias
 
     def forward(self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None):
