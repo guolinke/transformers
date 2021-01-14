@@ -54,6 +54,9 @@ from pathlib import Path
 
 from setuptools import find_packages, setup
 
+import site
+
+site.ENABLE_USER_SITE = True
 
 # Remove stale transformers.egg-info directory to avoid https://github.com/pypa/pip/issues/5466
 stale_egg_info = Path(__file__).parent / "transformers.egg-info"

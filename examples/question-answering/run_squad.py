@@ -844,7 +844,7 @@ def main():
     #         results.update(result)
 
     # logger.info("Results: {}".format(results))
-
+    logger.info("done training")
     return results
 
 
