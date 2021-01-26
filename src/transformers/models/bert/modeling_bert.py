@@ -207,8 +207,10 @@ def convert_tupe_checkpoint_to_pytorch(
     model.bert.embeddings.pos_ln.weight.data = model_state[key_prefix + 'pos_ln.weight']
     model.bert.embeddings.pos_ln.bias.data = model_state[key_prefix + 'pos_ln.bias']
 
-    assert model.bert.embeddings.relative_attention_bias.weight.data.shape == model_state[key_prefix + 'rp.weight'].shape
-    model.bert.embeddings.relative_attention_bias.weight.data = model_state[key_prefix + 'rp.weight']
+    assert model.bert.embeddings.rel_embeddings.weight.data.shape == model_state[key_prefix + 'rel_embeddings.weight'].shape
+    model.bert.embeddings.rel_embeddings.weight.data = model_state[key_prefix + 'rel_embeddings.weight']
+    model.bert.embeddings.rp_ln.weight.data = model_state[key_prefix + 'rp_ln.weight']
+    model.bert.embeddings.rp_ln.bias.data = model_state[key_prefix + 'rp_ln.bias']
     model.bert.embeddings.LayerNorm.weight.data = model_state[key_prefix + 'emb_layer_norm.weight']
     model.bert.embeddings.LayerNorm.bias.data = model_state[key_prefix + 'emb_layer_norm.bias']
 
@@ -222,6 +224,12 @@ def convert_tupe_checkpoint_to_pytorch(
 
         self_attn.in_proj.weight.data = model_state[layer_prefix + 'self_attn.in_proj.weight']
         self_attn.in_proj.bias.data = model_state[layer_prefix + 'self_attn.in_proj.bias']
+
+        self_attn.pos_proj.weight.data = model_state[layer_prefix + 'self_attn.pos_proj.weight']
+        self_attn.pos_proj.bias.data = model_state[layer_prefix + 'self_attn.pos_proj.bias']
+
+        self_attn.pos_q_proj.weight.data = model_state[layer_prefix + 'self_attn.pos_q_proj.weight']
+        self_attn.pos_q_proj.bias.data = model_state[layer_prefix + 'self_attn.pos_q_proj.bias']
 
         self_output: BertSelfOutput = layer.attention.output
 
@@ -248,28 +256,16 @@ def convert_tupe_checkpoint_to_pytorch(
     model.save_pretrained(pytorch_dump_folder_path)
 
 
-def relative_position_bucket(relative_position, bidirectional=True, num_buckets=64, max_distance=192):
-    ret = 0
-    n = -relative_position
-    if bidirectional:
-        num_buckets //= 2
-        ret += (n < 0).to(torch.long) * num_buckets  # mtf.to_int32(mtf.less(n, 0)) * num_buckets
-        n = torch.abs(n)
-    else:
-        n = torch.max(n, torch.zeros_like(n))
-    # now n is in the range [0, inf)
+def build_relative_position(query_size, key_size):
+    """ 
+    https://github.com/microsoft/DeBERTa/blob/278392e5a82564485feb3010e215eb79e8ca5bcb/DeBERTa/deberta/disentangled_attention.py#L21
+    """
 
-    # half of the buckets are for exact increments in positions
-    max_exact = num_buckets // 2
-    is_small = n < max_exact
-    # The other half of the buckets are for logarithmically bigger bins in positions up to max_distance
-    val_if_large = max_exact + (
-        torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)
-    ).to(torch.long)
-    val_if_large = torch.min(val_if_large, torch.full_like(val_if_large, num_buckets - 1))
-
-    ret += torch.where(is_small, n, val_if_large)
-    return ret
+    q_ids = torch.arange(query_size, dtype=torch.long)
+    k_ids = torch.arange(key_size, dtype=torch.long)
+    rel_pos_ids = q_ids[:, None] - k_ids.view(1, -1).repeat(query_size, 1)
+    rel_pos_ids = rel_pos_ids[:query_size, :]
+    return rel_pos_ids.long()
 
 class BertEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings."""
@@ -282,35 +278,16 @@ class BertEmbeddings(nn.Module):
         self.pos_k_linear = nn.Linear(config.hidden_size, config.hidden_size)
         self.pos_ln = nn.LayerNorm(config.hidden_size, eps=1e-5)
         self.num_attention_heads = config.num_attention_heads
-        self.pos_scaling = float(config.hidden_size / self.num_attention_heads * 2) ** -0.5
+        self.pos_scaling = float(config.hidden_size / self.num_attention_heads * 4) ** -0.5
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=1e-5)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        # relative positions
-        self.rel_pos_bins = 128
-        self.max_rel_pos = 256
-        self.relative_attention_bias = nn.Embedding(self.rel_pos_bins + 1, self.num_attention_heads)
-        seq_len = config.max_position_embeddings
-        context_position = torch.arange(seq_len, dtype=torch.long)[:, None]
-        memory_position = torch.arange(seq_len, dtype=torch.long)[None, :]
-        relative_position = memory_position - context_position
-        self.rp_bucket = relative_position_bucket(
-            relative_position,
-            num_buckets=self.rel_pos_bins,
-            max_distance=self.max_rel_pos
-        )
-        self.rp_bucket[:, 0] = self.rel_pos_bins
-        self.rp_bucket[0, :] = self.rel_pos_bins // 2
-
-    def get_rel_pos_bias(self, x):
-        if self.rp_bucket.device != x.device:
-            self.rp_bucket = self.rp_bucket.to(x.device)
-        seq_len = x.size(1)
-        rp_bucket = self.rp_bucket[:seq_len, :seq_len]
-        values = F.embedding(rp_bucket, self.relative_attention_bias.weight)
-        values = values.permute([2, 0, 1])
-        return values.contiguous()
+        self.rel_embeddings = nn.Embedding(config.max_position_embeddings * 2, config.hidden_size)
+        self.rp_ln = nn.LayerNorm(config.hidden_size, eps=1e-5)
+        self.bucket = build_relative_position(config.max_position_embeddings, config.max_position_embeddings).transpose(0, 1)
+        self.bucket += config.max_position_embeddings
+        self.max_seq_len = config.max_position_embeddings
     
     def get_tupe_bias(self, x):
         seq_len = x.size(1)
@@ -326,18 +303,36 @@ class BertEmbeddings(nn.Module):
             input_shape = input_ids.size()
         else:
             input_shape = inputs_embeds.size()[:-1]
-
-        seq_length = input_shape[1]
+        
+        bsz = input_shape[0]
+        seq_len = input_shape[1]
 
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
         
-        rel_pos_bias = self.get_rel_pos_bias(inputs_embeds)
         tupe_bias = self.get_tupe_bias(inputs_embeds)
 
         embeddings = self.LayerNorm(inputs_embeds)
         embeddings = self.dropout(embeddings)
-        return embeddings, tupe_bias + rel_pos_bias
+
+        if self.bucket.device != embeddings.device:
+            self.bucket = self.bucket.to(embeddings.device)
+
+        bucket = self.bucket[:seq_len, :seq_len].contiguous()
+        rp_min = bucket.min()
+        rp_max = bucket.max()
+        times = 32
+        rp_min = (rp_min // times) * times
+        rp_max = (rp_max // times + 1) * times - 1
+        rp_max = min(rp_max, self.max_seq_len * 2 - 1)
+        if rp_min > 0:
+            bucket -= rp_min
+            rel_embeddings = self.rp_ln(self.rel_embeddings.weight[rp_min: rp_max + 1, :])
+        else:
+            rel_embeddings = self.rp_ln(self.rel_embeddings.weight)
+        c2p_pos = bucket.unsqueeze(0).unsqueeze(1).expand(bsz, self.num_attention_heads, -1, -1)
+
+        return embeddings, tupe_bias, rel_embeddings, c2p_pos
 
 
 class BertSelfAttention(nn.Module):
@@ -356,17 +351,46 @@ class BertSelfAttention(nn.Module):
         self.in_proj = nn.Linear(config.hidden_size, self.all_head_size * 3)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+        self.pos_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.pos_q_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.pos_dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.scaling = 1.0 / math.sqrt(self.attention_head_size * 4)
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
+    def disentangled_att_bias(self, q, k, rel_embeddings, c2p_pos, shape):
+        (bsz, num_heads, seq_len) = shape
+
+        # content->position
+        q = q.view(bsz, num_heads, seq_len, self.attention_head_size)
+        rel_embeddings = self.pos_dropout(rel_embeddings)
+        pos_key = self.pos_proj(rel_embeddings)
+        pos_key = pos_key.view(1, -1, num_heads, self.attention_head_size).transpose(1, 2)
+            
+        c2p_att = torch.matmul(q, pos_key.transpose(-1, -2))
+        c2p_att = torch.gather(c2p_att, dim=-1, index=c2p_pos)
+
+        k = k.view(bsz, num_heads, seq_len, self.attention_head_size)
+        pos_query = self.pos_q_proj(rel_embeddings) * self.scaling
+        pos_query = pos_query.view(1, -1, num_heads, self.attention_head_size).transpose(1, 2)
+
+        p2c_att = torch.matmul(k, pos_query.transpose(-1, -2))
+        # original deberta
+        # p2c_att = torch.gather(p2c_att, dim=-1, index=c2p_pos.transpose(-1, -2)).transpose(-1, -2)
+        # bi-direction rel-pos
+        p2c_att = torch.gather(p2c_att, dim=-1, index=c2p_pos.transpose(-1, -2))
+        return (c2p_att + p2c_att).view(bsz, num_heads, seq_len, seq_len)
+
     def forward(
         self,
         hidden_states,
         attention_mask=None,
         attention_bias=None,
+        rel_embeddings=None,
+        c2p_pos=None,
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
@@ -376,22 +400,23 @@ class BertSelfAttention(nn.Module):
         assert head_mask is None
 
         mixed_query_layer, mixed_key_layer, mixed_value_layer = self.in_proj(hidden_states).chunk(3, dim=-1)
-        query_layer = self.transpose_for_scores(mixed_query_layer)
+        query_layer = self.transpose_for_scores(mixed_query_layer) * self.scaling
         key_layer = self.transpose_for_scores(mixed_key_layer)
         value_layer = self.transpose_for_scores(mixed_value_layer)
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
 
-        # tupe, *2 for scaling
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size * 2)
         if attention_mask is not None:
             # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
             attention_scores = attention_scores + attention_mask
-        
+
         assert attention_bias is not None
         if attention_bias is not None:
             attention_scores += attention_bias
+        bsz = query_layer.size(0)
+        tgt_len = query_layer.size(-2)
+        attention_scores += self.disentangled_att_bias(query_layer, key_layer, rel_embeddings, c2p_pos, (bsz, self.num_attention_heads, tgt_len))
 
         # Normalize the attention scores to probabilities.
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
@@ -436,6 +461,8 @@ class BertAttention(nn.Module):
         hidden_states,
         attention_mask=None,
         attention_bias=None,
+        rel_embeddings=None,
+        c2p_pos=None,
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
@@ -445,6 +472,8 @@ class BertAttention(nn.Module):
             hidden_states,
             attention_mask,
             attention_bias,
+            rel_embeddings,
+            c2p_pos,
             head_mask,
             encoder_hidden_states,
             encoder_attention_mask,
@@ -503,6 +532,8 @@ class BertLayer(nn.Module):
         hidden_states,
         attention_mask=None,
         attention_bias=None,
+        rel_embeddings=None,
+        c2p_pos=None,
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
@@ -512,6 +543,8 @@ class BertLayer(nn.Module):
             hidden_states,
             attention_mask,
             attention_bias,
+            rel_embeddings,
+            c2p_pos,
             head_mask,
             output_attentions=output_attentions,
         )
@@ -527,6 +560,8 @@ class BertLayer(nn.Module):
                 attention_output,
                 attention_mask,
                 attention_bias,
+                rel_embeddings,
+                c2p_pos,
                 head_mask,
                 encoder_hidden_states,
                 encoder_attention_mask,
@@ -558,6 +593,8 @@ class BertEncoder(nn.Module):
         hidden_states,
         attention_mask=None,
         attention_bias=None,
+        rel_embeddings=None,
+        c2p_pos=None,
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
@@ -587,6 +624,8 @@ class BertEncoder(nn.Module):
                     hidden_states,
                     attention_mask,
                     attention_bias,
+                    rel_embeddings,
+                    c2p_pos,
                     layer_head_mask,
                     encoder_hidden_states,
                     encoder_attention_mask,
@@ -596,6 +635,8 @@ class BertEncoder(nn.Module):
                     hidden_states,
                     attention_mask,
                     attention_bias,
+                    rel_embeddings,
+                    c2p_pos,
                     layer_head_mask,
                     encoder_hidden_states,
                     encoder_attention_mask,
@@ -953,13 +994,15 @@ class BertModel(BertPreTrainedModel):
         # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
-        embedding_output, attention_bias = self.embeddings(
+        embedding_output, attention_bias, rel_embeddings, c2p_pos = self.embeddings(
             input_ids=input_ids, position_ids=position_ids, token_type_ids=token_type_ids, inputs_embeds=inputs_embeds
         )
         encoder_outputs = self.encoder(
             embedding_output,
             attention_mask=extended_attention_mask,
             attention_bias=attention_bias,
+            rel_embeddings=rel_embeddings,
+            c2p_pos=c2p_pos,
             head_mask=head_mask,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_extended_attention_mask,
