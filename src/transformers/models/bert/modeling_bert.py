@@ -288,8 +288,8 @@ class BertEmbeddings(nn.Module):
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=1e-5)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         # relative positions
-        self.rel_pos_bins = 64
-        self.max_rel_pos = 192
+        self.rel_pos_bins = 128
+        self.max_rel_pos = 256
         self.relative_attention_bias = nn.Embedding(self.rel_pos_bins + 1, self.num_attention_heads)
         seq_len = config.max_position_embeddings
         context_position = torch.arange(seq_len, dtype=torch.long)[:, None]
