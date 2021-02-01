@@ -116,7 +116,7 @@ class BertConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vocab_size=28895,
+        vocab_size=50001,
         hidden_size=768,
         num_hidden_layers=12,
         num_attention_heads=12,
