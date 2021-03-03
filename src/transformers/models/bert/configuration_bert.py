@@ -116,7 +116,7 @@ class BertConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vocab_size=50001,
+        vocab_size=64000,
         hidden_size=768,
         num_hidden_layers=12,
         num_attention_heads=12,
@@ -128,7 +128,7 @@ class BertConfig(PretrainedConfig):
         type_vocab_size=2,
         initializer_range=0.02,
         layer_norm_eps=1e-5,
-        pad_token_id=0,
+        pad_token_id=1,
         gradient_checkpointing=False,
         position_embedding_type="absolute",
         **kwargs

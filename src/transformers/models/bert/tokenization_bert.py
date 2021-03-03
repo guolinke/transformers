@@ -17,7 +17,9 @@
 
 import collections
 import os
-import unicodedata
+import unicodedata, re
+import sentencepiece as spm
+from shutil import copyfile
 from typing import List, Optional, Tuple
 
 from ...tokenization_utils import PreTrainedTokenizer, _is_control, _is_punctuation, _is_whitespace
@@ -26,7 +28,7 @@ from ...utils import logging
 
 logger = logging.get_logger(__name__)
 
-VOCAB_FILES_NAMES = {"vocab_file": "vocab.txt"}
+VOCAB_FILES_NAMES = {"vocab_file": "sp.model"}
 
 PRETRAINED_VOCAB_FILES_MAP = {
     "vocab_file": {
@@ -113,6 +115,74 @@ def whitespace_tokenize(text):
     tokens = text.split()
     return tokens
 
+SPIECE_UNDERLINE = "▁"
+
+class FastBERTPreTokenizer(object):
+
+    def __init__(self):
+        self.transl_table = dict( [ (ord(x), ord(y)) for x,y in zip( u"‘’´“”—–-",  u"'''\"\"---") ] )
+
+    def handle_single_quote(self, tokens):
+        line = ' '.join(tokens)
+        line = re.sub(r"' ([smdSMDtT])\b", r"'\1", line)
+        line = re.sub(r"' ll\b", "'ll", line)
+        line = re.sub(r"' re\b", "'re", line)
+        line = re.sub(r"' ve\b", "'ve", line)
+        line = re.sub(r"' LL\b", "'LL ", line)
+        line = re.sub(r"' RE\b", "'RE ", line)
+        line = re.sub(r"' VE\b", "'VE ", line)
+        return line.split()
+
+    def split_pre_and_post_punc(self, tokens):
+        def pre_punc(token):
+            last_j = 0
+            for j in range(1, len(token)):
+                if not _is_punctuation(token[j]):
+                    last_j = j
+                    break
+            return token[:last_j], token[last_j:]
+        def post_punc(token):
+            last_j = len(token)
+            for j in range(len(token) - 2, -1, -1):
+                is_punc = _is_punctuation(token[j])
+                if not _is_punctuation(token[j]):
+                    last_j = j + 1
+                    break
+            return token[:last_j], token[last_j:]
+        new_tokens = []
+        for token in tokens:
+            if len(token) > 1 and _is_punctuation(token[0]):
+                a, b = pre_punc(token)
+                if a:
+                    new_tokens.append(a)
+                if b:
+                    if _is_punctuation(b[-1]):
+                        c, d = post_punc(b)
+                        if c:
+                            new_tokens.append(c)
+                        if d:
+                            new_tokens.append(d)
+                    else:
+                        new_tokens.append(b)
+            elif len(token) > 1 and _is_punctuation(token[-1]):
+                a, b = post_punc(token)
+                if a:
+                    new_tokens.append(a)
+                if b:
+                    new_tokens.append(b)
+            else:
+                new_tokens.append(token)
+        return new_tokens
+
+    def tokenize(self, line):
+        line = line.strip()
+        line = line.replace("``", '"').replace("''", '"')
+        line = line.translate(self.transl_table)
+        tokens = line.split()
+        tokens = self.split_pre_and_post_punc(tokens)
+        tokens = self.handle_single_quote(tokens)
+        return tokens
+
 
 class BertTokenizer(PreTrainedTokenizer):
     r"""
@@ -164,20 +234,20 @@ class BertTokenizer(PreTrainedTokenizer):
     def __init__(
         self,
         vocab_file,
-        do_lower_case=True,
-        do_basic_tokenize=True,
+        do_lower_case=False,
+        do_basic_tokenize=False,
         never_split=None,
         unk_token="[UNK]",
         sep_token="[SEP]",
         pad_token="[PAD]",
         cls_token="[CLS]",
         mask_token="[MASK]",
-        tokenize_chinese_chars=True,
+        tokenize_chinese_chars=False,
         strip_accents=None,
         **kwargs
     ):
         super().__init__(
-            do_lower_case=do_lower_case,
+            do_lower_case=False,
             do_basic_tokenize=do_basic_tokenize,
             never_split=never_split,
             unk_token=unk_token,
@@ -189,60 +259,69 @@ class BertTokenizer(PreTrainedTokenizer):
             strip_accents=strip_accents,
             **kwargs,
         )
-
-        if not os.path.isfile(vocab_file):
-            raise ValueError(
-                "Can't find a vocabulary file at path '{}'. To load the vocabulary from a Google pretrained "
-                "model use `tokenizer = BertTokenizer.from_pretrained(PRETRAINED_MODEL_NAME)`".format(vocab_file)
-            )
-        self.vocab = load_vocab(vocab_file)
-        self.ids_to_tokens = collections.OrderedDict([(ids, tok) for tok, ids in self.vocab.items()])
-        self.do_basic_tokenize = do_basic_tokenize
-        if do_basic_tokenize:
-            self.basic_tokenizer = BasicTokenizer(
-                do_lower_case=do_lower_case,
-                never_split=never_split,
-                tokenize_chinese_chars=tokenize_chinese_chars,
-                strip_accents=strip_accents,
-            )
-        self.wordpiece_tokenizer = WordpieceTokenizer(vocab=self.vocab, unk_token=self.unk_token)
+        self.vocab_file = vocab_file
+        self.sp_model = spm.SentencePieceProcessor()
+        self.sp_model.Load(vocab_file)
+        self.pre_tokenizer = FastBERTPreTokenizer()
 
     @property
     def do_lower_case(self):
-        return self.basic_tokenizer.do_lower_case
+        return False
 
     @property
     def vocab_size(self):
-        return len(self.vocab)
+        return len(self.sp_model)
 
     def get_vocab(self):
-        return dict(self.vocab, **self.added_tokens_encoder)
+        vocab = {self.convert_ids_to_tokens(i): i for i in range(self.vocab_size)}
+        vocab.update(self.added_tokens_encoder)
+        return vocab
 
-    def _tokenize(self, text):
-        split_tokens = []
-        if self.do_basic_tokenize:
-            for token in self.basic_tokenizer.tokenize(text, never_split=self.all_special_tokens):
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["sp_model"] = None
+        return state
 
-                # If the token is part of the never_split set
-                if token in self.basic_tokenizer.never_split:
-                    split_tokens.append(token)
-                else:
-                    split_tokens += self.wordpiece_tokenizer.tokenize(token)
+    def __setstate__(self, d):
+        self.__dict__ = d
+        self.sp_model = spm.SentencePieceProcessor()
+        self.sp_model.Load(self.vocab_file)
+
+    def preprocess_text(self, inputs):
+        return ' '.join(self.pre_tokenizer.tokenize(inputs))
+
+    def skip_space(self, tokens):
+        new_tokens = []
+        for i, token in enumerate(tokens):
+            skip = False
+            # skip single space, to reduce total length
+            if token == '\u2581':
+                if i == len(tokens) - 1 or _is_punctuation(tokens[i + 1][0]):
+                    skip = True
+            if not skip:
+                new_tokens.append(token)
+        return new_tokens
+
+    def _tokenize(self, text, sample=False):
+        """ Tokenize a string. """
+        text = self.preprocess_text(text)
+
+        if not sample:
+            pieces = self.sp_model.EncodeAsPieces(text)
         else:
-            split_tokens = self.wordpiece_tokenizer.tokenize(text)
-        return split_tokens
+            pieces = self.sp_model.SampleEncodeAsPieces(text, 64, 0.1)
+        return self.skip_space(pieces)
 
     def _convert_token_to_id(self, token):
         """ Converts a token (str) in an id using the vocab. """
-        return self.vocab.get(token, self.vocab.get(self.unk_token))
+        return self.sp_model.PieceToId(token)
 
     def _convert_id_to_token(self, index):
         """Converts an index (integer) in a token (str) using the vocab."""
-        return self.ids_to_tokens.get(index, self.unk_token)
+        return self.sp_model.IdToPiece(index)
 
     def convert_tokens_to_string(self, tokens):
-        """ Converts a sequence of tokens (string) in a single string. """
-        out_string = " ".join(tokens).replace(" ##", "").strip()
+        out_string = "".join(tokens).replace(SPIECE_UNDERLINE, " ").strip()
         return out_string
 
     def build_inputs_with_special_tokens(
@@ -332,24 +411,17 @@ class BertTokenizer(PreTrainedTokenizer):
         return len(cls + token_ids_0 + sep) * [0] + len(token_ids_1 + sep) * [1]
 
     def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> Tuple[str]:
-        index = 0
-        if os.path.isdir(save_directory):
-            vocab_file = os.path.join(
-                save_directory, (filename_prefix + "-" if filename_prefix else "") + VOCAB_FILES_NAMES["vocab_file"]
-            )
-        else:
-            vocab_file = (filename_prefix + "-" if filename_prefix else "") + save_directory
-        with open(vocab_file, "w", encoding="utf-8") as writer:
-            for token, token_index in sorted(self.vocab.items(), key=lambda kv: kv[1]):
-                if index != token_index:
-                    logger.warning(
-                        "Saving vocabulary to {}: vocabulary indices are not consecutive."
-                        " Please check that the vocabulary is not corrupted!".format(vocab_file)
-                    )
-                    index = token_index
-                writer.write(token + "\n")
-                index += 1
-        return (vocab_file,)
+        if not os.path.isdir(save_directory):
+            logger.error("Vocabulary path ({}) should be a directory".format(save_directory))
+            return
+        out_vocab_file = os.path.join(
+            save_directory, (filename_prefix + "-" if filename_prefix else "") + VOCAB_FILES_NAMES["vocab_file"]
+        )
+
+        if os.path.abspath(self.vocab_file) != os.path.abspath(out_vocab_file):
+            copyfile(self.vocab_file, out_vocab_file)
+
+        return (out_vocab_file,)
 
 
 class BasicTokenizer(object):

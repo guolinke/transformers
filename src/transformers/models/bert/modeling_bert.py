@@ -195,8 +195,8 @@ def convert_tupe_checkpoint_to_pytorch(
     model.bert.embeddings.pos_ln.weight.data = model_state[key_prefix + 'pos_ln.weight']
     model.bert.embeddings.pos_ln.bias.data = model_state[key_prefix + 'pos_ln.bias']
 
-    assert model.bert.embeddings.relative_attention_bias.weight.data.shape == model_state[key_prefix + 'relative_attention_bias.weight'].shape
-    model.bert.embeddings.relative_attention_bias.weight.data = model_state[key_prefix + 'relative_attention_bias.weight']
+    assert model.bert.embeddings.rp_bias.weight.data.shape == model_state[key_prefix + 'rp_bias.weight'].shape
+    model.bert.embeddings.rp_bias.weight.data = model_state[key_prefix + 'rp_bias.weight']
     model.bert.embeddings.LayerNorm.weight.data = model_state[key_prefix + 'emb_layer_norm.weight']
     model.bert.embeddings.LayerNorm.bias.data = model_state[key_prefix + 'emb_layer_norm.bias']
 
@@ -236,27 +236,21 @@ def convert_tupe_checkpoint_to_pytorch(
     model.save_pretrained(pytorch_dump_folder_path)
 
 
-def relative_position_bucket(relative_position, bidirectional=True, num_buckets=32, max_distance=128):
-    ret = 0
-    n = -relative_position
-    if bidirectional:
-        num_buckets //= 2
-        ret += (n < 0).to(torch.long) * num_buckets  # mtf.to_int32(mtf.less(n, 0)) * num_buckets
-        n = torch.abs(n)
-    else:
-        n = torch.max(n, torch.zeros_like(n))
-    # now n is in the range [0, inf)
+def relative_position_bucket(relative_position, num_buckets=32, max_distance=128):
+    sign = torch.sign(relative_position)
+    num_buckets //= 2
+    n = torch.abs(relative_position)
 
     # half of the buckets are for exact increments in positions
     max_exact = num_buckets // 2
     is_small = n < max_exact
+
     # The other half of the buckets are for logarithmically bigger bins in positions up to max_distance
     val_if_large = max_exact + (
         torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)
     ).to(torch.long)
     val_if_large = torch.min(val_if_large, torch.full_like(val_if_large, num_buckets - 1))
-
-    ret += torch.where(is_small, n, val_if_large)
+    ret = torch.where(is_small, n, val_if_large) * sign
     return ret
 
 class BertEmbeddings(nn.Module):
@@ -265,7 +259,7 @@ class BertEmbeddings(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings + 1, config.hidden_size)
+        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
         self.pos_q_linear = nn.Linear(config.hidden_size, config.hidden_size)
         self.pos_k_linear = nn.Linear(config.hidden_size, config.hidden_size)
         self.pos_ln = nn.LayerNorm(config.hidden_size, eps=1e-5)
@@ -276,9 +270,9 @@ class BertEmbeddings(nn.Module):
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=1e-5)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         # relative positions
-        self.rel_pos_bins = 32
-        self.max_rel_pos = 128
-        self.relative_attention_bias = nn.Embedding(self.rel_pos_bins + 1, self.num_attention_heads)
+        self.rel_pos_bins = 64
+        self.max_rel_pos = 192
+        self.rp_bias = nn.Embedding(self.rel_pos_bins + 1, self.num_attention_heads)
         seq_len = config.max_position_embeddings
         context_position = torch.arange(seq_len, dtype=torch.long)[:, None]
         memory_position = torch.arange(seq_len, dtype=torch.long)[None, :]
@@ -286,34 +280,31 @@ class BertEmbeddings(nn.Module):
         self.rp_bucket = relative_position_bucket(
             relative_position,
             num_buckets=self.rel_pos_bins,
-            max_distance=self.max_rel_pos
+            max_distance=self.max_rel_pos,
         )
-        self.rp_bucket[:, 0] = self.rel_pos_bins
-        self.rp_bucket[0, :] = self.rel_pos_bins // 2
+        # print(relative_position)
+        # cls reset for rel pos
+        self.rp_bucket[self.rp_bucket >= 0] += 2
+        self.rp_bucket[:, 0] = 0
+        self.rp_bucket[0, :] = 1
+        self.rp_bucket -= self.rp_bucket.min()
 
     def get_rel_pos_bias(self, x):
         if self.rp_bucket.device != x.device:
             self.rp_bucket = self.rp_bucket.to(x.device)
         seq_len = x.size(1)
         rp_bucket = self.rp_bucket[:seq_len, :seq_len]
-        values = F.embedding(rp_bucket, self.relative_attention_bias.weight)
+        values = F.embedding(rp_bucket, self.rp_bias.weight)
         values = values.permute([2, 0, 1])
         return values.contiguous()
     
     def get_tupe_bias(self, x):
         seq_len = x.size(1)
-        weight = self.pos_ln(self.position_embeddings.weight[:seq_len + 1, :])
-        pos_q =  self.pos_q_linear(weight).view(seq_len + 1, self.num_attention_heads, -1).transpose(0, 1) * (self.pos_scaling)
-        pos_k =  self.pos_k_linear(weight).view(seq_len + 1, self.num_attention_heads, -1).transpose(0, 1)
+        cls_weight = torch.mean(self.position_embeddings.weight[1:], dim=0).view(1, -1)
+        weight = self.pos_ln(torch.cat([cls_weight, self.position_embeddings.weight[1:seq_len, :]], dim=0))
+        pos_q =  self.pos_q_linear(weight).view(seq_len, self.num_attention_heads, -1).transpose(0, 1) * (self.pos_scaling)
+        pos_k =  self.pos_k_linear(weight).view(seq_len, self.num_attention_heads, -1).transpose(0, 1)
         abs_pos_bias = torch.bmm(pos_q, pos_k.transpose(1, 2))
-        # p_0 \dot p_0 is cls to others
-        cls_2_other = abs_pos_bias[:, 0, 0]
-        # p_1 \dot p_1 is others to cls
-        other_2_cls = abs_pos_bias[:, 1, 1]
-        # offset 
-        abs_pos_bias = abs_pos_bias[:, 1:, 1:]
-        abs_pos_bias[:, :, 0] = other_2_cls.view(-1, 1)
-        abs_pos_bias[:, 0, :] = cls_2_other.view(-1, 1)
         return abs_pos_bias
 
     def forward(self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None):
